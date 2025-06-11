@@ -5,13 +5,23 @@
 ### Build Tools
 ```bash
 # macOS
-brew install cmake ninja dfu-util
+brew install cmake ninja dfu-util ccache git
+# Optional: pkg-config for some crates
+brew install pkg-config
 
 # Linux (Ubuntu/Debian)
-sudo apt install cmake ninja-build dfu-util
+sudo apt-get install git cmake ninja-build ccache dfu-util libusb-1.0-0 \
+    libssl-dev libffi-dev python3 python3-pip python3-venv
 
 # Linux (Arch)
-sudo pacman -S cmake ninja dfu-util
+sudo pacman -S git cmake ninja ccache dfu-util libusb python-pip
+```
+
+### USB Permissions (Linux)
+```bash
+# Add user to dialout group for device access
+sudo usermod -a -G dialout $USER
+# Log out and back in for changes to take effect
 ```
 
 ### ESP-IDF Installation
