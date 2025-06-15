@@ -1,0 +1,2 @@
+Build the program with env SSID='<your_wifi_network_name>' PASSWORD='<your_wifi_network_password>' cargo build
+Run the program with env SSID='<your_wifi_network_name>' PASSWORD='<your_wifi_network_password>' cargo run

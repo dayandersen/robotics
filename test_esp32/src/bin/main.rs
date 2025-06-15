@@ -1,72 +1,188 @@
+//! DHCP Example
+//!
+//!
+//! Set SSID and PASSWORD env variable before running this example.
+//!
+//! This gets an ip address via DHCP then performs an HTTP get request to some "random" server
+//!
+
+//% FEATURES: esp-wifi esp-wifi/wifi  esp-hal/unstable esp-wifi/smoltcp
+//% CHIPS: esp32 esp32s2 esp32s3 esp32c2 esp32c3 esp32c6
+
+// esp-wifi/utils
+
 #![no_std]
 #![no_main]
-#![deny(
-    clippy::mem_forget,
-    reason = "mem::forget is generally not safe to do with esp_hal types, especially those \
-    holding buffers for the duration of a data transfer."
-)]
-
-use bt_hci::controller::ExternalController;
-use embassy_executor::Spawner;
-use embassy_time::{Duration, Timer};
-use esp_hal::clock::CpuClock;
-use esp_hal::timer::timg::TimerGroup;
-use esp_wifi::ble::controller::BleConnector;
-use log::info;
-
-#[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
-    loop {}
-}
 
 extern crate alloc;
+use core::net::Ipv4Addr;
 
-// This creates a default app-descriptor required by the esp-idf bootloader.
-// For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
+use blocking_network_stack::Stack;
+use embedded_io::*;
+use esp_alloc as _;
+use esp_backtrace as _;
+use esp_hal::{
+    clock::CpuClock,
+    main,
+    rng::Rng,
+    time::{self, Duration},
+    timer::timg::TimerGroup,
+};
+use esp_println::{print, println};
+use esp_wifi::{
+    init,
+    wifi::{ClientConfiguration, Configuration},
+};
+use smoltcp::{
+    iface::{SocketSet, SocketStorage},
+    wire::{DhcpOption, IpAddress},
+};
 
-#[cfg(not(target_arch = "xtensa"))]
 esp_bootloader_esp_idf::esp_app_desc!();
 
-#[cfg(target_arch = "xtensa")]
-const DEFAULT_HEAP_SIZE: usize = 32 * 1024;
-#[cfg(not(target_arch = "xtensa"))]
-const DEFAULT_HEAP_SIZE: usize = 64 * 1024;
+const SSID: &str = env!("SSID");
+const PASSWORD: &str = env!("PASSWORD");
 
-#[esp_hal_embassy::main]
-async fn main(spawner: Spawner) {
-    // generator version: 0.4.0
-
+#[main]
+fn main() -> ! {
     esp_println::logger::init_logger_from_env();
-
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    esp_alloc::heap_allocator!(size: DEFAULT_HEAP_SIZE);
-    // COEX needs more RAM - so we've added some more
-    esp_alloc::heap_allocator!(#[unsafe(link_section = ".dram2_uninit")] size: DEFAULT_HEAP_SIZE);
+    esp_alloc::heap_allocator!(size: 72 * 1024);
 
-    let timer0 = TimerGroup::new(peripherals.TIMG1);
-    esp_hal_embassy::init(timer0.timer0);
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
 
-    info!("Embassy initialized!");
+    let mut rng = Rng::new(peripherals.RNG);
 
-    let rng = esp_hal::rng::Rng::new(peripherals.RNG);
-    let timer1 = TimerGroup::new(peripherals.TIMG0);
-    let wifi_init = esp_wifi::init(timer1.timer0, rng, peripherals.RADIO_CLK)
-        .expect("Failed to initialize WIFI/BLE controller");
-    let (mut _wifi_controller, _interfaces) = esp_wifi::wifi::new(&wifi_init, peripherals.WIFI)
-        .expect("Failed to initialize WIFI controller");
-    // find more examples https://github.com/embassy-rs/trouble/tree/main/examples/esp32
-    let transport = BleConnector::new(&wifi_init, peripherals.BT);
-    let _ble_controller = ExternalController::<_, 20>::new(transport);
+    let esp_wifi_ctrl = init(timg0.timer0, rng.clone(), peripherals.RADIO_CLK).unwrap();
 
-    // TODO: Spawn some tasks
-    let _ = spawner;
+    let (mut controller, interfaces) =
+        esp_wifi::wifi::new(&esp_wifi_ctrl, peripherals.WIFI).unwrap();
 
-    loop {
-        info!("Hello world!");
-        Timer::after(Duration::from_secs(1)).await;
+    let mut device = interfaces.sta;
+    let iface = create_interface(&mut device);
+
+    let mut socket_set_entries: [SocketStorage; 3] = Default::default();
+    let mut socket_set = SocketSet::new(&mut socket_set_entries[..]);
+    let mut dhcp_socket = smoltcp::socket::dhcpv4::Socket::new();
+    // we can set a hostname here (or add other DHCP options)
+    dhcp_socket.set_outgoing_options(&[DhcpOption {
+        kind: 12,
+        data: b"esp-wifi",
+    }]);
+    socket_set.add(dhcp_socket);
+
+    let now = || time::Instant::now().duration_since_epoch().as_millis();
+    let stack = Stack::new(iface, device, socket_set, now, rng.random());
+
+    controller
+        .set_power_saving(esp_wifi::config::PowerSaveMode::None)
+        .unwrap();
+
+    let client_config = Configuration::Client(ClientConfiguration {
+        ssid: SSID.into(),
+        password: PASSWORD.into(),
+        ..Default::default()
+    });
+    let res = controller.set_configuration(&client_config);
+    println!("wifi_set_configuration returned {:?}", res);
+
+    controller.start().unwrap();
+    println!("is wifi started: {:?}", controller.is_started());
+
+    println!("Start Wifi Scan");
+    let res = controller.scan_n(10).unwrap();
+    for ap in res {
+        println!("{:?}", ap);
     }
 
-    // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.0.0-beta.1/examples/src/bin
+    println!("{:?}", controller.capabilities());
+    println!("wifi_connect {:?}", controller.connect());
+
+    // wait to get connected
+    println!("Wait to get connected");
+    loop {
+        match controller.is_connected() {
+            Ok(true) => break,
+            Ok(false) => {}
+            Err(err) => {
+                println!("{:?}", err);
+                loop {}
+            }
+        }
+    }
+    println!("{:?}", controller.is_connected());
+
+    // wait for getting an ip address
+    println!("Wait to get an ip address");
+    loop {
+        stack.work();
+
+        if stack.is_iface_up() {
+            println!("got ip {:?}", stack.get_ip_info());
+            break;
+        }
+    }
+
+    println!("Start busy loop on main");
+
+    let mut rx_buffer = [0u8; 1536];
+    let mut tx_buffer = [0u8; 1536];
+    let mut socket = stack.get_socket(&mut rx_buffer, &mut tx_buffer);
+
+    loop {
+        println!("Making HTTP request");
+        socket.work();
+
+        socket
+            .open(IpAddress::Ipv4(Ipv4Addr::new(192, 168, 50, 216)), 8000)
+            .unwrap();
+
+        socket
+            .write(b"GET / HTTP/1.0\r\nHost: 192.168.50.216:8000\r\n\r\n")
+            .unwrap();
+        socket.flush().unwrap();
+
+        let deadline = time::Instant::now() + Duration::from_secs(20);
+        let mut buffer = [0u8; 512];
+        while let Ok(len) = socket.read(&mut buffer) {
+            let to_print = unsafe { core::str::from_utf8_unchecked(&buffer[..len]) };
+            print!("{}", to_print);
+
+            if time::Instant::now() > deadline {
+                println!("Timeout");
+                break;
+            }
+        }
+        println!();
+
+        socket.disconnect();
+
+        let deadline = time::Instant::now() + Duration::from_secs(5);
+        while time::Instant::now() < deadline {
+            socket.work();
+        }
+    }
+}
+
+// some smoltcp boilerplate
+fn timestamp() -> smoltcp::time::Instant {
+    smoltcp::time::Instant::from_micros(
+        esp_hal::time::Instant::now()
+            .duration_since_epoch()
+            .as_micros() as i64,
+    )
+}
+
+pub fn create_interface(device: &mut esp_wifi::wifi::WifiDevice) -> smoltcp::iface::Interface {
+    // users could create multiple instances but since they only have one WifiDevice
+    // they probably can't do anything bad with that
+    smoltcp::iface::Interface::new(
+        smoltcp::iface::Config::new(smoltcp::wire::HardwareAddress::Ethernet(
+            smoltcp::wire::EthernetAddress::from_bytes(&device.mac_address()),
+        )),
+        device,
+        timestamp(),
+    )
 }
