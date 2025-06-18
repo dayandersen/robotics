@@ -13,10 +13,12 @@
 #![no_std]
 #![no_main]
 #![feature(type_alias_impl_trait)]
+#![feature(impl_trait_in_assoc_type)]
 
 use core::net::Ipv4Addr;
-
+use embedded_io_async::{Write};
 use embassy_executor::Spawner;
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
 use embassy_net::{tcp::TcpSocket, Runner, Stack, StackResources, IpListenEndpoint};
 use embassy_time::{Duration, Timer};
 use esp_alloc as _;
@@ -29,6 +31,9 @@ use esp_wifi::{
     wifi::{ClientConfiguration, Configuration, WifiController, WifiDevice, WifiEvent, WifiState},
 };
 use static_cell::make_static;
+
+use picoserve::{request::Path, response::{ws::Control, IntoResponse}, routing::{get, parse_path_segment, post}, AppRouter, AppWithStateBuilder};
+use picoserve::extract::State;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -46,6 +51,36 @@ static mut LED_ON: bool = false;
 
 const SSID: &str = env!("SSID");
 const PASSWORD: &str = env!("PASSWORD");
+const WEB_TASK_POOL_SIZE: usize = 8;
+
+#[derive(Clone, Copy)]
+struct SharedControl(&'static Mutex<CriticalSectionRawMutex, WifiController<'static>>);
+
+struct AppState {
+    shared_controller: SharedControl,
+}
+
+impl picoserve::extract::FromRef<AppState> for SharedControl {
+    fn from_ref(state: &AppState) -> Self {
+        state.shared_controller
+    }
+}
+
+struct AppProps;
+
+impl AppWithStateBuilder for AppProps {
+    type State = AppState;
+    type PathRouter = impl picoserve::routing::PathRouter<AppState>;
+
+    fn build_app(self) -> picoserve::Router<Self::PathRouter, Self::State> {
+        picoserve::Router::new()
+        .route("/", get(|| async move { "Hello World" }))
+        .route(("/set_led", parse_path_segment::<bool>()), get(|led_mode: bool| async move {
+            println!("Setting led mode to: {}", if led_mode { "ON" } else { "OFF" });
+            unsafe  {LED_ON = led_mode};
+        }))
+    }
+}
 
 #[esp_hal_embassy::main]
 async fn main(spawner: Spawner) -> ! {
@@ -75,15 +110,20 @@ async fn main(spawner: Spawner) -> ! {
     let (stack, runner) = embassy_net::new(
         wifi_interface,
         config,
-        mk_static!(StackResources<3>, StackResources::<3>::new()),
+        mk_static!(StackResources<WEB_TASK_POOL_SIZE>, StackResources::<WEB_TASK_POOL_SIZE>::new()),
         seed,
     );
 
-    let mut led_pin = Output::new(peripherals.GPIO18, Level::High, OutputConfig::default());
+    let mut led_pin = Output::new(peripherals.GPIO8, Level::High, OutputConfig::default());
 
-    spawner.spawn(connection(controller)).ok();
+    spawner.must_spawn(net_task(runner));
+     let shared_controller = SharedControl(
+        picoserve::make_static!(Mutex<CriticalSectionRawMutex, WifiController<'static>>, Mutex::new(controller)),
+    );
+    spawner.must_spawn(connection(shared_controller));
+    
     spawner.spawn(recv_message(stack)).ok();
-    spawner.spawn(net_task(runner)).ok();
+    
     loop {
         if stack.is_link_up() {
             break;
@@ -100,6 +140,25 @@ async fn main(spawner: Spawner) -> ! {
         Timer::after(Duration::from_millis(500)).await;
     }
 
+
+    let app = picoserve::make_static!(AppRouter<AppProps>, AppProps.build_app());
+
+    let config = picoserve::make_static!(
+        picoserve::Config<Duration>,
+        picoserve::Config::new(picoserve::Timeouts {
+            start_read_request: Some(Duration::from_secs(5)),
+            persistent_start_read_request: Some(Duration::from_secs(1)),
+            read_request: Some(Duration::from_secs(1)),
+            write: Some(Duration::from_secs(1)),
+        })
+        .keep_connection_alive()
+    );
+
+    
+
+    for id in 0..WEB_TASK_POOL_SIZE {
+        spawner.must_spawn(web_task(id, stack, app, config, AppState { shared_controller }));
+    }
 
     loop {
         Timer::after(Duration::from_millis(1_000)).await;
@@ -145,7 +204,6 @@ async fn recv_message(stack: Stack<'static>) {
 }
 
 async fn handle_client(socket: &mut TcpSocket<'_>) -> Result<(), embassy_net::tcp::Error> {
-    use embedded_io_async::{Read, Write};
     
     // Send welcome message
     socket.write_all(b"ESP32 Command Server Ready\r\nAvailable commands: LED_ON, LED_OFF, STATUS, PING\r\n> ").await?;
@@ -199,6 +257,33 @@ async fn handle_client(socket: &mut TcpSocket<'_>) -> Result<(), embassy_net::tc
     }
     
     Ok(())
+}
+
+#[embassy_executor::task(pool_size = WEB_TASK_POOL_SIZE)]
+async fn web_task(
+    id: usize,
+    stack: embassy_net::Stack<'static>,
+    app: &'static AppRouter<AppProps>,
+    config: &'static picoserve::Config<Duration>,
+    state: AppState,
+) -> ! {
+    let port = 80;
+    let mut tcp_rx_buffer = [0; 1024];
+    let mut tcp_tx_buffer = [0; 1024];
+    let mut http_buffer = [0; 2048];
+
+    picoserve::listen_and_serve_with_state(
+        id,
+        app,
+        config,
+        stack,
+        port,
+        &mut tcp_rx_buffer,
+        &mut tcp_tx_buffer,
+        &mut http_buffer,
+        &state
+    )
+    .await
 }
 
 fn process_command(command: &str) -> &'static str {
@@ -267,44 +352,69 @@ async fn send_message(stack: Stack<'_>) {
     }
 }
 
+
 #[embassy_executor::task]
-pub async fn connection(mut controller: WifiController<'static>) {
+pub async fn connection(shared_controller: SharedControl) {
     println!("start connection task");
-    println!("Device capabilities: {:?}", controller.capabilities());
+    
+    // First, get capabilities outside the main loop
+    {
+        let controller = shared_controller.0.lock().await;
+        println!("Device capabilities: {:?}", controller.capabilities());
+    } // Lock is dropped here
+    
     loop {
         match esp_wifi::wifi::wifi_state() {
             WifiState::StaConnected => {
-                // wait until we're no longer connected
+                // Wait for disconnection event
+                let mut controller = shared_controller.0.lock().await;
                 controller.wait_for_event(WifiEvent::StaDisconnected).await;
-                Timer::after(Duration::from_millis(5000)).await
+                drop(controller); // Explicitly drop the lock
+                Timer::after(Duration::from_millis(5000)).await;
             }
             _ => {}
         }
-        if !matches!(controller.is_started(), Ok(true)) {
-            let client_config = Configuration::Client(ClientConfiguration {
-                ssid: SSID.into(),
-                password: PASSWORD.into(),
-                ..Default::default()
-            });
-            controller.set_configuration(&client_config).unwrap();
-            println!("Starting wifi");
-            controller.start_async().await.unwrap();
-            println!("Wifi started!");
+        
+        // Check if controller is started and configure if needed
+        {
+            let mut controller = shared_controller.0.lock().await;
+            
+            if !matches!(controller.is_started(), Ok(true)) {
+                let client_config = Configuration::Client(ClientConfiguration {
+                    ssid: SSID.into(),
+                    // password: PASSWORD.into(),
+                    ..Default::default()
+                });
+                controller.set_configuration(&client_config).unwrap();
+                println!("Starting wifi");
+                controller.start_async().await.unwrap();
+                println!("Wifi started!");
 
-            println!("Scan");
-            let result = controller.scan_n_async(10).await.unwrap();
-            for ap in result {
-                println!("{:?}", ap);
+                println!("Scan");
+                let result = controller.scan_n_async(10).await.unwrap();
+                for ap in result {
+                    println!("{:?}", ap);
+                }
             }
-        }
+        } // Lock is dropped here
+        
         println!("About to connect...");
-
-        match controller.connect_async().await {
-            Ok(_) => println!("Wifi connected!"),
-            Err(e) => {
-                println!("Failed to connect to wifi: {e:?}");
-                Timer::after(Duration::from_millis(5000)).await
+        
+        // Connect in a separate scope
+        {
+            let mut controller = shared_controller.0.lock().await;
+            match controller.connect_async().await {
+                Ok(_) => println!("Wifi connected!"),
+                Err(e) => {
+                    println!("Failed to connect to wifi: {e:?}");
+                    // Lock will be dropped at end of scope
+                }
             }
+        } // Lock is dropped here
+        
+        // Only sleep if connection failed
+        if !matches!(esp_wifi::wifi::wifi_state(), WifiState::StaConnected) {
+            Timer::after(Duration::from_millis(5000)).await;
         }
     }
 }
