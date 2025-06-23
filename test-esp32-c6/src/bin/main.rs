@@ -51,7 +51,7 @@ static mut LED_ON: bool = false;
 
 const SSID: &str = env!("SSID");
 const PASSWORD: &str = env!("PASSWORD");
-const WEB_TASK_POOL_SIZE: usize = 8;
+const WEB_TASK_POOL_SIZE: usize = 4;
 
 #[derive(Clone, Copy)]
 struct SharedControl(&'static Mutex<CriticalSectionRawMutex, WifiController<'static>>);
@@ -77,7 +77,7 @@ impl AppWithStateBuilder for AppProps {
         .route("/", get(|| async move { "Hello World" }))
         .route(("/set_led", parse_path_segment::<bool>()), get(|led_mode: bool| async move {
             println!("Setting led mode to: {}", if led_mode { "ON" } else { "OFF" });
-            unsafe  {LED_ON = led_mode};
+            unsafe  {LED_ON = !led_mode};
         }))
     }
 }
@@ -106,23 +106,21 @@ async fn main(spawner: Spawner) -> ! {
 
     let seed = (rng.random() as u64) << 32 | rng.random() as u64;
 
-    // Init network stack
+    // Init network stack -- we set task pool size to 2 x the web task pool size
     let (stack, runner) = embassy_net::new(
         wifi_interface,
         config,
-        mk_static!(StackResources<WEB_TASK_POOL_SIZE>, StackResources::<WEB_TASK_POOL_SIZE>::new()),
+        mk_static!(StackResources<{2 * WEB_TASK_POOL_SIZE}>, StackResources::<{2 * WEB_TASK_POOL_SIZE}>::new()),
         seed,
     );
 
-    let mut led_pin = Output::new(peripherals.GPIO8, Level::High, OutputConfig::default());
+    let mut led_pin = Output::new(peripherals.GPIO15, Level::High, OutputConfig::default());
 
     spawner.must_spawn(net_task(runner));
      let shared_controller = SharedControl(
         picoserve::make_static!(Mutex<CriticalSectionRawMutex, WifiController<'static>>, Mutex::new(controller)),
     );
     spawner.must_spawn(connection(shared_controller));
-    
-    spawner.spawn(recv_message(stack)).ok();
     
     loop {
         if stack.is_link_up() {
@@ -161,9 +159,10 @@ async fn main(spawner: Spawner) -> ! {
     }
 
     loop {
-        Timer::after(Duration::from_millis(1_000)).await;
-        send_message(stack).await;
+        Timer::after(Duration::from_millis(2_000)).await;
+        // send_message(stack).await;
         unsafe  {
+            println!("LED is now {}", if LED_ON { "OFF" } else { "ON" });
             if LED_ON == true {
                 led_pin.set_high();
             } else {
@@ -173,91 +172,6 @@ async fn main(spawner: Spawner) -> ! {
     }
 }
 
-#[embassy_executor::task]
-async fn recv_message(stack: Stack<'static>) {
-    let mut rx_buffer = [0; 4096];
-    let mut tx_buffer = [0; 4096];
-    
-    loop {
-        rx_buffer.fill(0);
-        tx_buffer.fill(0);
-
-        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
-        
-        match socket.accept(IpListenEndpoint { addr: None, port: 8080 }).await {
-            Ok(_) => {
-                println!("Someone is talking to me!");
-                if let Err(e) = handle_client(&mut socket).await {
-                    println!("Client handling error: {:?}", e);
-                }
-                println!("Client disconnected");
-            }
-            Err(e) => {
-                println!("Accept error: {:?}", e);
-                Timer::after(Duration::from_millis(1000)).await;
-            }
-        }
-        
-        socket.close();
-        Timer::after(Duration::from_millis(100)).await;
-    }
-}
-
-async fn handle_client(socket: &mut TcpSocket<'_>) -> Result<(), embassy_net::tcp::Error> {
-    
-    // Send welcome message
-    socket.write_all(b"ESP32 Command Server Ready\r\nAvailable commands: LED_ON, LED_OFF, STATUS, PING\r\n> ").await?;
-
-    let mut buffer = [0u8; 256];
-    let mut pos = 0;
-
-    loop {
-        match socket.read(&mut buffer[pos..]).await {
-            Ok(0) => {
-                println!("Client disconnected (EOF)");
-                break;
-            }
-            Ok(len) => {
-                pos += len;
-                
-                // Look for complete command (ended with \r\n or \n)
-                if let Some(newline_pos) = buffer[..pos].iter().position(|&b| b == b'\n') {
-                    let command_bytes = &buffer[..newline_pos];
-                    let command = str::from_utf8(command_bytes)
-                        .unwrap_or("")
-                        .trim_end_matches('\r')
-                        .trim();
-                    
-                    println!("Received command: '{}'", command);
-                    
-                    // Process command
-                    let response = process_command(command);
-                    socket.write_all(response.as_bytes()).await?;
-                    socket.write_all(b"\r\n> ").await?;
-                    
-                    // Move remaining data to beginning of buffer
-                    let remaining = pos - newline_pos - 1;
-                    if remaining > 0 {
-                        buffer.copy_within(newline_pos + 1..pos, 0);
-                    }
-                    pos = remaining;
-                }
-                
-                // Prevent buffer overflow
-                if pos >= buffer.len() {
-                    socket.write_all(b"ERROR: Command too long\r\n> ").await?;
-                    pos = 0;
-                }
-            }
-            Err(e) => {
-                println!("Read error: {:?}", e);
-                return Err(e);
-            }
-        }
-    }
-    
-    Ok(())
-}
 
 #[embassy_executor::task(pool_size = WEB_TASK_POOL_SIZE)]
 async fn web_task(
@@ -286,29 +200,7 @@ async fn web_task(
     .await
 }
 
-fn process_command(command: &str) -> &'static str {
-    match command.to_uppercase().as_str() {
-        "LED_ON" => {
-            unsafe { LED_ON = true; }
-            "OK: LED turned ON"
-        }
-        "LED_OFF" => {
-            unsafe { LED_ON = false; }
-            "OK: LED turned OFF"
-        }
-        "STATUS" => {
-            if unsafe { LED_ON } {
-                "STATUS: LED is ON"
-            } else {
-                "STATUS: LED is OFF"
-            }
-        }
-        "PING" => "PONG",
-        "HELP" => "Available commands: LED_ON, LED_OFF, STATUS, PING, HELP",
-        "" => "ERROR: Empty command",
-        _ => "ERROR: Unknown command. Type HELP for available commands",
-    }
-}
+
 
 async fn send_message(stack: Stack<'_>) {
 
@@ -382,7 +274,7 @@ pub async fn connection(shared_controller: SharedControl) {
             if !matches!(controller.is_started(), Ok(true)) {
                 let client_config = Configuration::Client(ClientConfiguration {
                     ssid: SSID.into(),
-                    // password: PASSWORD.into(),
+                    password: PASSWORD.into(),
                     ..Default::default()
                 });
                 controller.set_configuration(&client_config).unwrap();
