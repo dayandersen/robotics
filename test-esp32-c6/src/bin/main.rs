@@ -50,7 +50,7 @@ impl Dht11Reading {
 
 impl fmt::Display for Dht11Reading {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        return write!(f, "Humdity: {}.{} | Temp: {}.{} | Checksum: {}", 
+        return write!(f, "Humdity: {}.{}% | Temp: {}.{}C | Checksum: {}", 
             self.humidity_integer, self.humidity_decimal, self.temperature_integer, self.temperature_decimal, self.checksum
         );
     }
@@ -115,8 +115,6 @@ esp_println::logger::init_logger_from_env();
         wait_with_timeout(&dht_flex_pin, 1000, Level::High);
         println!("DHT has set pin to high");
         println!("Waiting until DHT sets pin to low to signal data transmission");
-        wait_with_timeout(&dht_flex_pin, 1000, Level::Low);
-        println!("DHT has set pin to low again");
         println!("Now we can read bits");
         // Now we can start reading our 40 bits
         
