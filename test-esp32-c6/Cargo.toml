@@ -3,6 +3,9 @@ edition = "2021"
 name    = "test-c6"
 version = "0.1.0"
 
+[lints.clippy]
+needless_return = "allow"
+
 [[bin]]
 name = "test-c6"
 path = "./src/bin/main.rs"

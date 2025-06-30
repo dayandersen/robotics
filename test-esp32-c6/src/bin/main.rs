@@ -5,20 +5,14 @@
 
 use core::fmt;
 
-use embedded_io_async::{Write};
 use embassy_executor::Spawner;
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex};
-use embassy_net::{new, tcp::TcpSocket, IpListenEndpoint, Runner, Stack, StackResources};
 use embassy_time::{Duration, Instant, Timer};
 use esp_alloc as _;
 use esp_backtrace as _;
-use esp_hal::{clock::CpuClock, gpio::{Flex, Input, InputConfig, Level, Output, OutputConfig}, peripherals::GPIO, rng::Rng, timer::timg::{etm::Tasks, TimerGroup}};
+use esp_hal::timer::timg::TimerGroup;
+use esp_hal::{clock::CpuClock, gpio::Flex};
+use esp_hal::gpio::Level;
 use esp_println::println;
-use esp_wifi::{
-    init, wifi::{ClientConfiguration, Configuration, WifiController, WifiDevice, WifiEvent, WifiState}, EspWifiController, EspWifiTimerSource
-};
-use static_cell::make_static;
-
 esp_bootloader_esp_idf::esp_app_desc!();
 
 struct Dht11Reading {
@@ -37,17 +31,20 @@ impl Dht11Reading {
             temperature_integer: Self::bits_to_int(buffer, 16, 24),
             temperature_decimal:Self::bits_to_int(buffer, 24, 32),
             checksum:Self::bits_to_int(buffer, 32, 40),
-        }
-        ;
+        };
     }
 
     fn bits_to_int(buffer: &[i32], start: usize, end: usize) -> i32 {
         let mut num = 0;
 
-        for i in start..end {
-            num += buffer[i]  << (end - (i + 1))
-        }
+        (start..end).for_each(|i| {
+            num += buffer[i]  << (end - (i + 1));
+        });
         return num;
+    }
+
+    pub fn is_valid(&self) -> bool {
+        return (self.humidity_decimal + self.humidity_integer + self.temperature_decimal + self.temperature_integer) & 0xFF == self.checksum
     }
 }
 
@@ -57,6 +54,21 @@ impl fmt::Display for Dht11Reading {
             self.humidity_integer, self.humidity_decimal, self.temperature_integer, self.temperature_decimal, self.checksum
         );
     }
+}
+
+
+// Waits a certain amount of time with a busy loop, then returns with success and the time taken, or failure and the timeout.
+// State to measure 
+fn wait_with_timeout(dht_flex_pin: &Flex, timeout_micros: u64, goal_state: Level) -> (bool, Duration) {
+    let start = Instant::now();
+    while dht_flex_pin.level() != goal_state {
+        if start.elapsed().as_micros() > timeout_micros {
+            println!("We done timed out :(");
+            return (false, start.elapsed())
+        }
+
+    }
+    return (true, start.elapsed())
 }
 
 #[esp_hal_embassy::main]
@@ -72,10 +84,15 @@ esp_println::logger::init_logger_from_env();
     dht_flex_pin.set_high();
     // spawner.spawn(pull_dht_data(make_static!(dht_data_pin)));
     let mut dht_buffer = [0; 40];
+    let mut pulse_duration_micros = [0; 40];
     loop {
-        Timer::after(Duration::from_millis(2000)).await;
-        println!("Starting to measure from probe");
+        dht_buffer.fill(0);
+        pulse_duration_micros.fill(0);
+        Timer::after(Duration::from_secs(5)).await;
         dht_flex_pin.set_output_enable(true);
+        dht_flex_pin.set_high();
+        Timer::after(Duration::from_millis(250)).await;
+        println!("Starting priming sequence for DHT11 probe");
         // Start priming the dht 11 sensor to send data.
         // We must wait at least 18 ms before we can read the data. Waiting 20ms here.
         dht_flex_pin.set_low();
@@ -85,36 +102,37 @@ esp_println::logger::init_logger_from_env();
         // After the minimum time has passed, we need to set the pin to high.
         dht_flex_pin.set_high();
         println!("Set pin high");
-        Timer::after(Duration::from_micros(30)).await;
         dht_flex_pin.set_output_enable(false);
         dht_flex_pin.set_input_enable(true);
 
         // Wait until the DHT 11 sensors sets the pin to low
         println!("Waiting until DHT sets pin to low");
-        while dht_flex_pin.level() == Level::High {}
+        wait_with_timeout(&dht_flex_pin, 1000, Level::Low);
         println!("DHT has set pin to low");
 
         // This is the prefix to basically swap ownership of the data pin from sender to reader
         println!("Waiting until DHT sets pin to high");
-        while dht_flex_pin.level() == Level::Low {}
+        wait_with_timeout(&dht_flex_pin, 1000, Level::High);
         println!("DHT has set pin to high");
-        println!("Waiting until DHT sets pin to low again");
-        while dht_flex_pin.level() == Level::High {}
-        println!("DHT set pin to low again");
-
+        println!("Waiting until DHT sets pin to low to signal data transmission");
+        wait_with_timeout(&dht_flex_pin, 1000, Level::Low);
+        println!("DHT has set pin to low again");
         println!("Now we can read bits");
         // Now we can start reading our 40 bits
-        for i in 0..40 {
-            while dht_flex_pin.level() == Level::High {}
-            while dht_flex_pin.level() == Level::Low {}
-            let start = Instant::now();
-            while dht_flex_pin.level() == Level::High {}
-
-            dht_buffer[i] = i32::from(start.elapsed() >= Duration::from_micros(40));
-        }
-
+        
+        (0..40).for_each(|i| {
+            wait_with_timeout(&dht_flex_pin, 1000, Level::High);
+            let (_timed_out, time_high) = wait_with_timeout(&dht_flex_pin, 1000, Level::Low);
+            pulse_duration_micros[i] = time_high.as_micros();
+            dht_buffer[i] = i32::from(time_high >= Duration::from_micros(40));
+        });
+        
+        pulse_duration_micros.iter().enumerate().for_each(|(ind, val)|
+            println!("high_duration for index '{}' was '{}'", ind, val)
+        );
         let dht_read = Dht11Reading::from_buffer(&dht_buffer);
         dht_flex_pin.set_input_enable(false);
-        println!("Level read as: '{}'", dht_read);
+        println!("Validity: {}, level read as: '{}'", dht_read.is_valid(), dht_read);
     }
+    
 }
